@@ -1716,7 +1716,8 @@ impl ContainerEngine {
         let _lifecycle = cell.lifecycle.lock().await;
         let container_id = self.running_id(cell, run)?;
         anyhow::ensure!(
-            cell.state.lock().unwrap().execution.is_none(),
+            cell.state.lock().unwrap().execution.is_none()
+                && !execution::required(&cell.spec.class_name)?,
             "host-issued executions cannot accept additional execs"
         );
         let mut body = json!({
