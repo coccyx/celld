@@ -2351,6 +2351,15 @@ class ContainerPort {
   }
 }
 class Container {
+  // celld host extension. The token names a single-use, host-owned grant;
+  // no Worker-supplied path, command, image or policy reaches the engine.
+  async runExecution(token) {
+    const result = await __container_run_execution(this._scope, String(token));
+    return JSON.parse(result);
+  }
+  stopExecution(token) {
+    return __container_stop_execution(this._scope, String(token));
+  }
   constructor(scope) {
     this._scope = scope;
     this._runState = {};

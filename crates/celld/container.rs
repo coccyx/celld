@@ -23,6 +23,8 @@
 //! into its engine the first time a cell of that class starts, so a node
 //! never talks to a registry.
 
+pub mod execution;
+
 use crate::asyncrt;
 use crate::docker::{frame_header, Docker, Stream};
 use anyhow::{anyhow, Context};
@@ -206,6 +208,7 @@ struct CellState {
     container_id: Option<String>,
     /// A create may have reached the daemon without returning its ID.
     creating: bool,
+    execution: Option<Arc<execution::Execution>>,
     idle_epoch: u64,
     /// Where the node dials the container: the bridge address on Linux,
     /// the published loopback ports elsewhere.
@@ -287,6 +290,7 @@ impl CellContainer {
         state.run += 1;
         state.running = true;
         state.starting = true;
+        state.execution = None;
         state.address = Address::None;
         state.idle_epoch += 1;
         state.sweeper = None;
@@ -459,11 +463,18 @@ pub async fn prewarm() {
             return;
         }
     };
-    if let Err(error) = engine.ensure_fence().await {
-        tracing::warn!(
-            error = %format!("{error:#}"),
-            "the container bridges are not fenced; no container starts on this node"
-        );
+    let needs_bridge = SPECS
+        .read()
+        .unwrap()
+        .iter()
+        .any(|spec| !execution::required(&spec.class_name).unwrap_or(false));
+    if needs_bridge {
+        if let Err(error) = engine.ensure_fence().await {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "the container bridges are not fenced; no container starts on this node"
+            );
+        }
     }
     let specs = SPECS.read().unwrap().clone();
     for spec in specs {
@@ -912,7 +923,12 @@ impl ContainerEngine {
             .unwrap()
             .values()
             .filter(|cell| cell.running())
-            .map(|cell| instance_memory_bytes(cell.spec.instance_type.as_deref()))
+            .map(|cell| {
+                cell.state.lock().unwrap().execution.as_ref().map_or_else(
+                    || instance_memory_bytes(cell.spec.instance_type.as_deref()),
+                    |e| e.profile.memory_bytes,
+                )
+            })
             .sum()
     }
 
@@ -1107,10 +1123,21 @@ impl ContainerEngine {
         run: u64,
         params: StartParams,
     ) -> anyhow::Result<Address> {
-        self.ensure_fence().await?;
+        let execution = cell.state.lock().unwrap().execution.clone();
+        anyhow::ensure!(
+            execution.is_some() || !execution::required(&cell.spec.class_name)?,
+            "this class requires a host execution grant"
+        );
+        if execution.is_none() {
+            self.ensure_fence().await?;
+        }
         self.enforce_instance_ceiling(cell).await?;
         self.ensure_image(&cell.spec.image).await?;
-        let (open, internal) = self.networks().await?;
+        let (open, internal) = if execution.is_some() {
+            (String::new(), String::new())
+        } else {
+            self.networks().await?
+        };
         let previous = cell.state.lock().unwrap().container_id.clone();
         if let Some(id) = previous {
             self.remove_container(&id).await?;
@@ -1210,6 +1237,30 @@ impl ContainerEngine {
         if let Some(entrypoint) = params.entrypoint {
             body["Cmd"] = json!(entrypoint);
         }
+        if let Some(execution) = &execution {
+            execution.check_live()?;
+            // Load through celld's existing bucket/image integration, then insist
+            // on the immutable image authorized by the host profile.
+            let image = self
+                .docker
+                .expect(
+                    "GET",
+                    &format!("/images/{}/json", cell.spec.image),
+                    None,
+                    "inspect approved image",
+                )
+                .await?
+                .json()?;
+            anyhow::ensure!(
+                image["Id"] == execution.profile.image,
+                "class image does not match the host profile"
+            );
+            let labels = body["Labels"].clone();
+            body = execution.body();
+            body["Labels"] = labels;
+            body["Labels"]["celld.execution"] = json!(execution.token);
+            execution.check_live()?;
+        }
         // A lost create reply is ambiguous. Keep the pending identity so a
         // later destroy can reconcile it by name, owner and run label.
         cell.state.lock().unwrap().creating = true;
@@ -1241,6 +1292,9 @@ impl ContainerEngine {
             let mut state = cell.state.lock().unwrap();
             state.container_id = Some(id.clone());
             state.creating = false;
+        }
+        if let Some(execution) = &execution {
+            execution.check_live()?;
         }
         self.docker
             .expect(
@@ -1310,6 +1364,16 @@ impl ContainerEngine {
             }
             state.stopping = true;
         }
+        let execution = {
+            let state = cell.state.lock().unwrap();
+            state
+                .execution
+                .clone()
+                .filter(|_| state.container_id.is_some() || state.creating)
+        };
+        if let Some(execution) = execution {
+            execution.fence()?;
+        }
         let creating = cell.state.lock().unwrap().creating;
         if creating {
             let info = self.inspect_owned(cell, Some(run)).await?;
@@ -1352,6 +1416,133 @@ impl ContainerEngine {
             true
         });
         Ok(())
+    }
+
+    /// Execute a host-approved command and remove its process tree before
+    /// returning output. Mount contents are retained for the host's checkpoint.
+    pub async fn run_execution(
+        &self,
+        cell: &Arc<CellContainer>,
+        run: u64,
+        token: &str,
+    ) -> anyhow::Result<Value> {
+        let execution = match execution::Execution::claim(&cell.scope, &cell.spec.class_name, token)
+        {
+            Ok(execution) => Arc::new(execution),
+            Err(error) => {
+                let mut state = cell.state.lock().unwrap();
+                if state.run == run {
+                    state.running = state.container_id.is_some() || state.creating;
+                    state.starting = false;
+                    cell.exit
+                        .send_replace(Some((run, Err(format!("{error:#}")))));
+                }
+                return Err(error);
+            }
+        };
+        {
+            let mut state = cell.state.lock().unwrap();
+            anyhow::ensure!(
+                state.run == run && !state.retired,
+                "execution was superseded"
+            );
+            state.execution = Some(execution.clone());
+        }
+        let deadline = Duration::from_millis(execution.grant.deadline_ms);
+        let outcome = asyncrt::timeout(deadline, async {
+            self.start(
+                cell,
+                run,
+                StartParams {
+                    entrypoint: None,
+                    env: Vec::new(),
+                    enable_internet: false,
+                    labels: Vec::new(),
+                },
+            )
+            .await?;
+            self.monitor(cell, run).await.map_err(anyhow::Error::msg)
+        })
+        .await;
+        // Keep a persistent kernel fence even if a daemon reply is lost or a
+        // start request completes after our own deadline. The host owns its removal.
+        execution.fence()?;
+        let _lifecycle = cell.lifecycle.lock().await;
+        let id = {
+            let state = cell.state.lock().unwrap();
+            anyhow::ensure!(state.run == run, "execution was superseded");
+            state.container_id.clone()
+        };
+        let output = if let Some(id) = &id {
+            self.execution_output(id).await
+        } else {
+            Ok((String::new(), String::new()))
+        };
+        self.destroy_locked(cell, run, false).await?;
+        let (stdout, stderr) = output?;
+        let code = match outcome {
+            Ok(Ok(code)) => code,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => 124,
+        };
+        Ok(
+            json!({"exitCode":code,"stdout":stdout,"stderr":stderr,"stopped":true,"execution":token}),
+        )
+    }
+
+    pub async fn stop_execution(
+        &self,
+        cell: &Arc<CellContainer>,
+        token: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(execution::token_valid(token), "invalid execution token");
+        execution::revoke(&cell.scope, token)?;
+        let (run, execution) = {
+            let mut state = cell.state.lock().unwrap();
+            let Some(execution) = state.execution.clone().filter(|e| e.token == token) else {
+                return Ok(());
+            };
+            state.stopping = true;
+            (state.run, execution)
+        };
+        if cell.state.lock().unwrap().container_id.is_some() {
+            execution.fence()?;
+        }
+        self.destroy_run(cell, run).await
+    }
+
+    async fn execution_output(&self, id: &str) -> anyhow::Result<(String, String)> {
+        let reply = self
+            .docker
+            .expect(
+                "GET",
+                &format!("/containers/{id}/logs?stdout=true&stderr=true"),
+                None,
+                "execution logs",
+            )
+            .await?;
+        anyhow::ensure!(
+            reply.body.len() <= 5 * 1024 * 1024,
+            "execution output exceeds limit"
+        );
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let mut rest: &[u8] = &reply.body;
+        while !rest.is_empty() {
+            anyhow::ensure!(rest.len() >= 8, "truncated execution output");
+            let (stream, length) = frame_header(rest[..8].try_into().unwrap());
+            anyhow::ensure!(
+                length <= rest.len() - 8 && [1, 2].contains(&stream),
+                "invalid execution output"
+            );
+            let target = if stream == 1 {
+                &mut stdout
+            } else {
+                &mut stderr
+            };
+            target.extend_from_slice(&rest[8..8 + length]);
+            rest = &rest[8 + length..];
+        }
+        Ok((String::from_utf8(stdout)?, String::from_utf8(stderr)?))
     }
 
     pub async fn signal(
@@ -1455,6 +1646,10 @@ impl ContainerEngine {
     ) -> anyhow::Result<Arc<ExecProcess>> {
         let _lifecycle = cell.lifecycle.lock().await;
         let container_id = self.running_id(cell, run)?;
+        anyhow::ensure!(
+            cell.state.lock().unwrap().execution.is_none(),
+            "host-issued executions cannot accept additional execs"
+        );
         let mut body = json!({
             "AttachStdin": true,
             "AttachStdout": true,

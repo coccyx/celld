@@ -524,7 +524,13 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     // node runs it once, privileged, to fence its bridges before the first
     // container starts. Built like an app image, keyed by content, so every
     // deployment made by one celld shares one tar.
-    let fence_image = (!container_specs.is_empty())
+    let needs_fence = container_specs
+        .iter()
+        .map(|spec| crate::container::execution::required(&spec.class_name))
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .any(|restricted| !restricted);
+    let fence_image = needs_fence
         .then(|| resolve_fence_image(platform.as_deref()))
         .transpose()?;
     let started = Instant::now();
