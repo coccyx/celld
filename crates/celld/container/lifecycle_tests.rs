@@ -12,6 +12,127 @@ use tokio::sync::oneshot;
 const TEST_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const NEXT_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
+fn recovered_info() -> Value {
+    json!({"Id":TEST_ID,"Config":{"Labels":{
+        "celld.node":"previous-process", "celld.cell":"test-scope", "celld.class":"Test",
+        "celld.execution":"c".repeat(64)}},"HostConfig":{"CgroupParent":"/issued/task/guest"}})
+}
+fn recovery_replies(info: Value) -> Vec<Reply> {
+    vec![
+        Reply {
+            method: "GET",
+            path: "/containers/json?".into(),
+            status: 200,
+            body: json!([{"Id":TEST_ID}]),
+            gate: None,
+        },
+        Reply {
+            method: "GET",
+            path: format!("/containers/{TEST_ID}/json"),
+            status: 200,
+            body: info,
+            gate: None,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn issued_execution_recovery_removes_previous_process_container_by_exact_id() {
+    let mut replies = recovery_replies(recovered_info());
+    replies.push(remove(&format!("/containers/{TEST_ID}?force=true"), 204));
+    let (engine, cell, daemon) = fixture(replies);
+    // A new node has no in-memory association with the old execution. Its
+    // current run must not be changed by cleanup of the separately issued run.
+    cell.state.lock().unwrap().container_id = Some(NEXT_ID.into());
+    engine
+        .remove_recovered_execution(
+            &cell,
+            &"c".repeat(64),
+            std::path::Path::new("/sys/fs/cgroup/issued/task/guest"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        cell.state.lock().unwrap().container_id.as_deref(),
+        Some(NEXT_ID)
+    );
+    let path = daemon.requests.lock().unwrap()[0].1.clone();
+    let filter = path.split("&filters=").nth(1).unwrap();
+    let decoded = percent_encoding::percent_decode_str(filter)
+        .decode_utf8()
+        .unwrap();
+    let value: Value = serde_json::from_str(&decoded).unwrap();
+    assert_eq!(
+        value,
+        json!({"label":[format!("celld.execution={}","c".repeat(64)),"celld.cell=test-scope"]})
+    );
+    daemon.finish().await;
+}
+
+#[tokio::test]
+async fn issued_execution_recovery_revalidates_every_identity_before_removal() {
+    for pointer in [
+        "/Id",
+        "/Config/Labels/celld.execution",
+        "/Config/Labels/celld.cell",
+        "/Config/Labels/celld.class",
+        "/HostConfig/CgroupParent",
+    ] {
+        let mut info = recovered_info();
+        *info.pointer_mut(pointer).unwrap() = json!(NEXT_ID);
+        let (engine, cell, daemon) = fixture(recovery_replies(info));
+        assert!(engine
+            .remove_recovered_execution(
+                &cell,
+                &"c".repeat(64),
+                std::path::Path::new("/sys/fs/cgroup/issued/task/guest")
+            )
+            .await
+            .is_err());
+        daemon.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn issued_execution_recovery_does_not_acknowledge_engine_failure() {
+    for stage in 0..3 {
+        let mut replies = recovery_replies(recovered_info());
+        replies.push(remove(&format!("/containers/{TEST_ID}?force=true"), 204));
+        replies[stage].status = 500;
+        replies.truncate(stage + 1);
+        let (engine, cell, daemon) = fixture(replies);
+        cell.state.lock().unwrap().container_id = None;
+        assert!(engine
+            .remove_recovered_execution(
+                &cell,
+                &"c".repeat(64),
+                std::path::Path::new("/sys/fs/cgroup/issued/task/guest")
+            )
+            .await
+            .is_err());
+        daemon.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn issued_execution_recovery_clears_an_adopted_handle_after_confirmed_removal() {
+    let mut replies = recovery_replies(recovered_info());
+    replies.push(kill(409));
+    replies.push(remove(&format!("/containers/{TEST_ID}?force=true"), 204));
+    let (engine, cell, daemon) = fixture(replies);
+    engine
+        .remove_recovered_execution(
+            &cell,
+            &"c".repeat(64),
+            std::path::Path::new("/sys/fs/cgroup/issued/task/guest"),
+        )
+        .await
+        .unwrap();
+    assert!(!cell.running());
+    assert!(cell.state.lock().unwrap().container_id.is_none());
+    daemon.finish().await;
+}
+
 struct Reply {
     method: &'static str,
     path: String,

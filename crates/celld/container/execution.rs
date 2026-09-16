@@ -151,7 +151,7 @@ pub fn required(class: &str) -> anyhow::Result<bool> {
             .any(|p| p.classes.iter().any(|n| n == class))
     }))
 }
-pub fn revoke(scope: &str, token: &str) -> anyhow::Result<()> {
+pub fn revoke(scope: &str, class: &str, token: &str) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(token_valid(token), "invalid execution token");
     let config =
         configuration()?.ok_or_else(|| anyhow!("host execution profiles are not configured"))?;
@@ -160,8 +160,22 @@ pub fn revoke(scope: &str, token: &str) -> anyhow::Result<()> {
     let file = protected(if source.exists() { &source } else { &claimed })?;
     let grant: Grant = read(file)?;
     anyhow::ensure!(
-        grant.scope == scope,
+        grant.version == 1 && grant.scope == scope,
         "execution grant belongs to another scope"
+    );
+    let profile = config
+        .profiles
+        .get(&grant.profile)
+        .filter(|p| p.classes.iter().any(|c| c == class))
+        .ok_or_else(|| anyhow!("execution profile does not authorize this class"))?;
+    anyhow::ensure!(
+        clean(&grant.cgroup)
+            && clean(&profile.cgroup_root)
+            && profile.cgroup_root.starts_with("/sys/fs/cgroup")
+            && profile.cgroup_root != Path::new("/sys/fs/cgroup")
+            && grant.cgroup.starts_with(&profile.cgroup_root)
+            && grant.cgroup != profile.cgroup_root,
+        "execution cgroup exceeds host policy"
     );
     let path = config.grants.join(format!("{token}.revoked"));
     match OpenOptions::new()
@@ -175,7 +189,11 @@ pub fn revoke(scope: &str, token: &str) -> anyhow::Result<()> {
         Err(error) => return Err(error.into()),
     }
     File::open(config.grants)?.sync_all()?;
-    Ok(())
+    // Recovery may have no in-memory Execution after celld restarts. Preserve
+    // the kernel fence before reconciling delayed or stopped engine objects.
+    fs::write(grant.cgroup.join("cgroup.freeze"), "1")?;
+    fs::write(grant.cgroup.join("cgroup.kill"), "1")?;
+    Ok(grant.cgroup)
 }
 
 impl Execution {
