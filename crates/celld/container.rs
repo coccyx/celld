@@ -1496,19 +1496,88 @@ impl ContainerEngine {
         token: &str,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(execution::token_valid(token), "invalid execution token");
-        execution::revoke(&cell.scope, token)?;
-        let (run, execution) = {
+        let cgroup = execution::revoke(&cell.scope, &cell.spec.class_name, token)?;
+        let run = {
             let mut state = cell.state.lock().unwrap();
-            let Some(execution) = state.execution.clone().filter(|e| e.token == token) else {
-                return Ok(());
-            };
-            state.stopping = true;
-            (state.run, execution)
+            if state.execution.as_ref().is_some_and(|e| e.token == token) {
+                state.stopping = true;
+                Some(state.run)
+            } else {
+                None
+            }
         };
-        if cell.state.lock().unwrap().container_id.is_some() {
-            execution.fence()?;
+        let _lifecycle = cell.lifecycle.lock().await;
+        if let Some(run) = run {
+            self.destroy_locked(cell, run, false).await
+        } else {
+            self.remove_recovered_execution(cell, token, &cgroup).await
         }
-        self.destroy_run(cell, run).await
+    }
+
+    // Process/node identity changes after a restart. The protected host grant
+    // authorizes cleanup of this exact execution across those identities, not
+    // a mutable name or another execution now occupying the cell's slot.
+    async fn remove_recovered_execution(
+        &self,
+        cell: &CellContainer,
+        token: &str,
+        cgroup: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let filters = json!({"label":[format!("celld.execution={token}"), format!("celld.cell={}", cell.scope)]}).to_string();
+        let list = self
+            .docker
+            .expect(
+                "GET",
+                &format!(
+                    "/containers/json?all=true&filters={}",
+                    percent_encoding::utf8_percent_encode(
+                        &filters,
+                        percent_encoding::NON_ALPHANUMERIC
+                    )
+                ),
+                None,
+                "list issued execution",
+            )
+            .await?
+            .json()?;
+        let list = list
+            .as_array()
+            .ok_or_else(|| anyhow!("execution list answered without an array"))?;
+        let expected_group = format!("/{}", cgroup.strip_prefix("/sys/fs/cgroup")?.display());
+        for entry in list {
+            let id = engine_container_id(entry)?;
+            let reply = self
+                .docker
+                .call("GET", &format!("/containers/{id}/json"), None)
+                .await?;
+            if reply.status.as_u16() == 404 {
+                continue;
+            }
+            anyhow::ensure!(
+                reply.status.is_success(),
+                "inspect recovered execution failed"
+            );
+            let info = reply.json()?;
+            let labels = &info["Config"]["Labels"];
+            anyhow::ensure!(
+                engine_container_id(&info)? == id
+                    && labels["celld.execution"].as_str() == Some(token)
+                    && labels["celld.cell"].as_str() == Some(&cell.scope)
+                    && labels["celld.class"].as_str() == Some(&cell.spec.class_name)
+                    && info["HostConfig"]["CgroupParent"].as_str() == Some(&expected_group),
+                "recovered container does not match the issued execution"
+            );
+            let (run, attached) = {
+                let state = cell.state.lock().unwrap();
+                (state.run, state.container_id.as_deref() == Some(&id))
+            };
+            if attached {
+                self.destroy_locked(cell, run, false).await?;
+            } else {
+                self.remove_container(&id).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn execution_output(&self, id: &str) -> anyhow::Result<(String, String)> {
