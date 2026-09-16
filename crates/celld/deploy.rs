@@ -711,7 +711,23 @@ fn resolve_image(root: &Path, image: &str, platform: Option<&str>) -> anyhow::Re
     let platform_args = platform
         .map(|platform| vec!["--platform", platform])
         .unwrap_or_default();
-    let id = if is_dockerfile(root, image) {
+    let id = if is_image_id(image) {
+        // A package can import an immutable image without registry access.
+        // Unlike a tag, this cannot resolve to newer bytes. Still enforce the
+        // fleet platform before publishing the image to its bucket.
+        let held: Value = serde_json::from_str(&run_engine(
+            &["image", "inspect", "--format", "{{json .}}", image],
+            "inspect imported image",
+        )?)?;
+        anyhow::ensure!(held["Id"] == image, "imported image identity mismatch");
+        if let Some(platform) = platform {
+            anyhow::ensure!(
+                image_platform_matches(&held, platform),
+                "imported image does not match platform {platform}"
+            );
+        }
+        image.to_owned()
+    } else if is_dockerfile(root, image) {
         let path = root.join(image);
         let context = path
             .parent()
@@ -748,6 +764,23 @@ fn resolve_image(root: &Path, image: &str, platform: Option<&str>) -> anyhow::Re
     let reference = crate::container::image_reference(&format!("{:x}", Sha256::digest(&content)));
     run_engine(&["tag", &id, &reference], "tag container image")?;
     Ok(reference)
+}
+
+fn is_image_id(image: &str) -> bool {
+    image.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+fn image_platform_matches(image: &Value, platform: &str) -> bool {
+    let parts: Vec<_> = platform.split('/').collect();
+    matches!(parts.len(), 2 | 3)
+        && image["Os"] == parts[0]
+        && image["Architecture"] == parts[1]
+        && (parts.len() == 2 || image["Variant"] == parts[2])
 }
 
 /// The image the node fences its bridges with: `nft` and nothing else.
@@ -2765,4 +2798,39 @@ fn strip_jsonc(source: &str) -> String {
 #[cfg(all(test, celld_internal_tests))]
 mod deploy_contract {
     include!(env!("CELLD_INTERNAL_DEPLOY_TESTS"));
+}
+
+#[cfg(test)]
+mod imported_image_tests {
+    use super::*;
+
+    #[test]
+    fn only_complete_immutable_engine_ids_bypass_registry_resolution() {
+        assert!(is_image_id(&format!("sha256:{}", "a".repeat(64))));
+        for value in [
+            "image:latest",
+            "sha256:abc",
+            "image@sha256:abc",
+            "sha256:../../host",
+        ] {
+            assert!(!is_image_id(value));
+        }
+    }
+
+    #[test]
+    fn imported_image_must_match_the_selected_fleet_platform() {
+        let image = json!({"Os":"linux","Architecture":"arm64","Variant":"v8"});
+        assert!(image_platform_matches(&image, "linux/arm64"));
+        assert!(image_platform_matches(&image, "linux/arm64/v8"));
+        for platform in [
+            "linux/amd64",
+            "windows/arm64",
+            "linux/arm64/v7",
+            "linux/arm64/v8/extra",
+            "arm64",
+        ] {
+            assert!(!image_platform_matches(&image, platform));
+        }
+        assert!(!image_platform_matches(&json!({}), "linux/arm64"));
+    }
 }
