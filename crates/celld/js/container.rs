@@ -342,3 +342,47 @@ pub(super) fn op_container_exec_drop(
     let id = number_arg(scope, &args, 0);
     container::drop_process(id);
 }
+
+pub(super) fn op_container_run_execution(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let name = string_arg(scope, &args, 0);
+    let token = string_arg(scope, &args, 1);
+    let (engine, cell) = match cell_for(&name) {
+        Ok(target) => target,
+        Err(error) => return loader_throw(scope, &error),
+    };
+    let run = match cell.begin_run() {
+        Ok(run) => run,
+        Err(error) => return loader_throw(scope, &error.to_string()),
+    };
+    let async_id = asyncrt::enqueue_io_context(async move {
+        engine
+            .run_execution(&cell, run, &token)
+            .await
+            .map(|value| value.to_string())
+            .map_err(|error| format!("{error:#}"))
+    });
+    rv.set(promise_for(scope, async_id));
+}
+
+pub(super) fn op_container_stop_execution(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let name = string_arg(scope, &args, 0);
+    let token = string_arg(scope, &args, 1);
+    let target = cell_for(&name);
+    let async_id = asyncrt::enqueue(async move {
+        let (engine, cell) = target?;
+        engine
+            .stop_execution(&cell, &token)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        Ok::<String, String>(String::new())
+    });
+    rv.set(promise_for(scope, async_id));
+}
