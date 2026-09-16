@@ -2353,7 +2353,7 @@ class ContainerPort {
 class Container {
   constructor(scope) {
     this._scope = scope;
-    this._destroyReason = undefined;
+    this._runState = {};
   }
   // The host's answer, not a JavaScript flag: a monitor() promise can be
   // dropped with its event, so the flag it would maintain could go stale.
@@ -2381,23 +2381,27 @@ class Container {
       throw new RangeError("Hard timeout must be greater than 0");
     // Fire and forget, as on Cloudflare: a start that fails reports
     // through monitor(). The host marks the run as running at once.
-    this._destroyReason = undefined;
-    __container_start(this._scope, JSON.stringify(params)).catch(() => {});
+    const started = __container_start(this._scope, JSON.stringify(params));
+    this._runState = {};
+    started.catch(() => {});
   }
   async monitor() {
     if (!this.running)
       throw new Error("monitor() cannot be called on a container that is not running.");
+    // Keep the reason with the run this monitor observes. A late callback
+    // must not read or clear a replacement run's destruction reason.
+    const state = this._runState;
     let raw;
     try {
       raw = await __container_monitor(this._scope);
     } catch (error) {
-      this._destroyReason = undefined;
+      state.destroyReason = undefined;
       throw error;
     }
     const exitCode = Number(raw);
-    if (this._destroyReason !== undefined) {
-      const reason = this._destroyReason;
-      this._destroyReason = undefined;
+    if (state.destroyReason !== undefined) {
+      const reason = state.destroyReason;
+      state.destroyReason = undefined;
       throw reason;
     }
     if (exitCode !== 0) {
@@ -2407,8 +2411,9 @@ class Container {
     }
   }
   async destroy(error) {
-    if (!this.running) return;
-    if (this._destroyReason === undefined) this._destroyReason = error;
+    // A root process exit does not prove container removal. Always let the
+    // host retry cleanup of a stopped or ambiguously removed instance.
+    if (this._runState.destroyReason === undefined) this._runState.destroyReason = error;
     await __container_destroy(this._scope);
   }
   signal(signo) {
