@@ -536,13 +536,43 @@ impl ContainerEngine {
             )
             .await?;
         let list = reply.json()?;
-        for entry in list.as_array().into_iter().flatten() {
-            if let Some(id) = entry.get("Id").and_then(Value::as_str) {
-                let _ = self
-                    .docker
-                    .call("DELETE", &format!("/containers/{id}?force=true"), None)
-                    .await;
+        let list = list
+            .as_array()
+            .ok_or_else(|| anyhow!("list containers answered without an array"))?;
+        let mut failures = Vec::new();
+        for entry in list {
+            let Some(id) = entry.get("Id").and_then(Value::as_str) else {
+                failures.push("list containers answered without a container id".to_string());
+                continue;
+            };
+            if let Err(error) = self.remove_container(id).await {
+                // Try every container even if one cannot be removed. On
+                // startup the error refuses the engine; on shutdown the
+                // caller reports that containers may still be running.
+                failures.push(format!("{id}: {error:#}"));
             }
+        }
+        if !failures.is_empty() {
+            return Err(anyhow!("reap containers failed: {}", failures.join("; ")));
+        }
+        Ok(())
+    }
+
+    /// Removal is idempotent, but a failed request is not evidence that
+    /// the container is gone. In particular, a lost daemon connection must
+    /// leave the handle available for a later cleanup attempt.
+    async fn remove_container(&self, id: &str) -> anyhow::Result<()> {
+        let reply = self
+            .docker
+            .call("DELETE", &format!("/containers/{id}?force=true"), None)
+            .await
+            .context("remove container")?;
+        if !reply.status.is_success() && reply.status.as_u16() != 404 {
+            return Err(anyhow!(
+                "remove container failed with [{}] {}",
+                reply.status.as_u16(),
+                reply.message()
+            ));
         }
         Ok(())
     }
@@ -968,15 +998,20 @@ impl ContainerEngine {
                             reply.message()
                         ));
                     }
-                    reply
-                        .json()?
-                        .get("StatusCode")
+                    let body = reply.json()?;
+                    // Docker can report a wait failure in a successful
+                    // HTTP response. StatusCode alone is not an exit in
+                    // that case.
+                    if let Some(error) = body.get("Error").filter(|value| !value.is_null()) {
+                        return Err(anyhow!("wait failed: {error}"));
+                    }
+                    body.get("StatusCode")
                         .and_then(Value::as_i64)
                         .ok_or_else(|| anyhow!("wait answered without a status code"))
                 })
                 .map_err(|error| format!("{error:#}"));
             let mut state = cell_.state.lock().unwrap();
-            if state.run == run {
+            if state.run == run && result.is_ok() {
                 state.running = false;
                 state.address = Address::None;
             }
@@ -1178,7 +1213,10 @@ impl ContainerEngine {
 
     pub async fn destroy(&self, cell: &Arc<CellContainer>) -> anyhow::Result<()> {
         // Kill first so the wait task reports 137 before the removal makes
-        // the name disappear under it.
+        // the name disappear under it. The process may already have exited
+        // or been removed, so a failed kill can still be followed by a
+        // successful force-remove. Only confirmed removal (including 404)
+        // lets this call acknowledge destruction.
         let _ = self
             .docker
             .call(
@@ -1187,14 +1225,7 @@ impl ContainerEngine {
                 None,
             )
             .await;
-        let _ = self
-            .docker
-            .call(
-                "DELETE",
-                &format!("/containers/{}?force=true", cell.name),
-                None,
-            )
-            .await;
+        self.remove_container(&cell.name).await?;
         let mut state = cell.state.lock().unwrap();
         state.running = false;
         state.address = Address::None;
@@ -1243,7 +1274,15 @@ impl ContainerEngine {
     }
 
     async fn forget(&self, cell: &Arc<CellContainer>) {
-        let _ = self.destroy(cell).await;
+        if let Err(error) = self.destroy(cell).await {
+            tracing::warn!(
+                event = "container_destroy_failed",
+                cell = %cell.scope,
+                error = %format!("{error:#}"),
+                "retaining the container handle for a later cleanup attempt"
+            );
+            return;
+        }
         for id in cell.processes.lock().unwrap().drain(..) {
             drop_process(id);
         }
@@ -1360,6 +1399,9 @@ impl ContainerEngine {
         Ok(process)
     }
 }
+
+#[cfg(all(test, not(celld_internal_tests)))]
+mod lifecycle_tests;
 
 pub struct ExecParams {
     pub cmd: Vec<String>,
