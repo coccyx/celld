@@ -1406,6 +1406,11 @@ impl ContainerEngine {
         state.container_id = None;
         state.retired = retire;
         state.address = Address::None;
+        // Confirmed destruction ends the mount pin's lifetime. Keeping the
+        // stopped execution here holds deleted workspace inodes (and their
+        // project quota) until another run or cell retirement. Failed removal
+        // returns above and must retain those pins for safe reconciliation.
+        state.execution = None;
         // A removed run has a terminal result even if its delayed Docker wait
         // answers 404. Preserve a process exit already observed for this run.
         cell.exit.send_if_modified(|exit| {
