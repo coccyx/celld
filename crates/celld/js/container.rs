@@ -10,10 +10,11 @@ use super::*;
 use crate::container::{self, CellContainer, ContainerEngine, ExecParams, StartParams};
 use std::time::Duration;
 
-async fn cell_for(scope: &str) -> Result<(Arc<ContainerEngine>, Arc<CellContainer>), String> {
-    let engine = container::engine()
-        .await
-        .map_err(|error| format!("{error:#}"))?;
+fn cell_for(scope: &str) -> Result<(Arc<ContainerEngine>, Arc<CellContainer>), String> {
+    // Capture the attached handle on the calling thread. Looking it up after
+    // enqueueing could bind an old request to a replacement activation.
+    let engine = container::engine_if_ready()
+        .ok_or_else(|| "the container engine is not ready".to_string())?;
     let cell = engine
         .cell(scope)
         .ok_or_else(|| "this Durable Object has no container".to_string())?;
@@ -87,12 +88,15 @@ pub(super) fn op_container_start(
     };
     // The run opens here, on the calling thread, so the monitor() that
     // follows this call in the same turn waits for this start's exit.
-    let run = container::engine_if_ready()
-        .and_then(|engine| engine.cell(&cell))
-        .map(|cell| cell.begin_run());
+    let (engine, cell) = match cell_for(&cell) {
+        Ok(target) => target,
+        Err(error) => return loader_throw(scope, &error),
+    };
+    let run = match cell.begin_run() {
+        Ok(run) => run,
+        Err(error) => return loader_throw(scope, &error.to_string()),
+    };
     let async_id = asyncrt::enqueue_io_context(async move {
-        let (engine, cell) = cell_for(&cell).await?;
-        let run = run.unwrap_or_else(|| cell.begin_run());
         engine
             .start(
                 &cell,
@@ -122,11 +126,12 @@ pub(super) fn op_container_monitor(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = string_arg(scope, &args, 0);
-    let run = container::engine_if_ready()
-        .and_then(|engine| engine.cell(&cell))
-        .map_or(0, |cell| cell.current_run());
+    let target = cell_for(&cell).map(|(engine, cell)| {
+        let run = cell.current_run();
+        (engine, cell, run)
+    });
     let async_id = asyncrt::enqueue_unrefed(async move {
-        let (engine, cell) = cell_for(&cell).await?;
+        let (engine, cell, run) = target?;
         let code = engine.monitor(&cell, run).await?;
         Ok::<String, String>(code.to_string())
     });
@@ -139,10 +144,14 @@ pub(super) fn op_container_destroy(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = string_arg(scope, &args, 0);
+    let target = cell_for(&cell).map(|(engine, cell)| {
+        let run = cell.request_destroy();
+        (engine, cell, run)
+    });
     let async_id = asyncrt::enqueue(async move {
-        let (engine, cell) = cell_for(&cell).await?;
+        let (engine, cell, run) = target?;
         engine
-            .destroy(&cell)
+            .destroy_run(&cell, run)
             .await
             .map_err(|error| format!("{error:#}"))?;
         Ok::<String, String>(String::new())
@@ -157,10 +166,14 @@ pub(super) fn op_container_signal(
 ) {
     let cell = string_arg(scope, &args, 0);
     let signal = number_arg(scope, &args, 1) as u32;
+    let target = cell_for(&cell).map(|(engine, cell)| {
+        let run = cell.current_run();
+        (engine, cell, run)
+    });
     let async_id = asyncrt::enqueue(async move {
-        let (engine, cell) = cell_for(&cell).await?;
+        let (engine, cell, run) = target?;
         engine
-            .signal(&cell, signal)
+            .signal(&cell, run, signal)
             .await
             .map_err(|error| format!("{error:#}"))?;
         Ok::<String, String>(String::new())
@@ -175,8 +188,9 @@ pub(super) fn op_container_inactivity(
 ) {
     let cell = string_arg(scope, &args, 0);
     let duration = number_arg(scope, &args, 1);
+    let target = cell_for(&cell);
     let async_id = asyncrt::enqueue(async move {
-        let (_, cell) = cell_for(&cell).await?;
+        let (_, cell) = target?;
         cell.set_inactivity(Duration::from_millis(duration));
         Ok::<String, String>(String::new())
     });
@@ -205,11 +219,16 @@ pub(super) fn op_container_exec(
         Ok(request) => request,
         Err(error) => return loader_throw(scope, &format!("exec(): {error}")),
     };
+    let target = cell_for(&cell).map(|(engine, cell)| {
+        let run = cell.current_run();
+        (engine, cell, run)
+    });
     let async_id = asyncrt::enqueue(async move {
-        let (engine, cell) = cell_for(&cell).await?;
+        let (engine, cell, run) = target?;
         let process = engine
             .exec(
                 &cell,
+                run,
                 ExecParams {
                     cmd: request.cmd,
                     env: request.env,
@@ -322,4 +341,48 @@ pub(super) fn op_container_exec_drop(
 ) {
     let id = number_arg(scope, &args, 0);
     container::drop_process(id);
+}
+
+pub(super) fn op_container_run_execution(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let name = string_arg(scope, &args, 0);
+    let token = string_arg(scope, &args, 1);
+    let (engine, cell) = match cell_for(&name) {
+        Ok(target) => target,
+        Err(error) => return loader_throw(scope, &error),
+    };
+    let run = match cell.begin_run() {
+        Ok(run) => run,
+        Err(error) => return loader_throw(scope, &error.to_string()),
+    };
+    let async_id = asyncrt::enqueue_io_context(async move {
+        engine
+            .run_execution(&cell, run, &token)
+            .await
+            .map(|value| value.to_string())
+            .map_err(|error| format!("{error:#}"))
+    });
+    rv.set(promise_for(scope, async_id));
+}
+
+pub(super) fn op_container_stop_execution(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let name = string_arg(scope, &args, 0);
+    let token = string_arg(scope, &args, 1);
+    let target = cell_for(&name);
+    let async_id = asyncrt::enqueue(async move {
+        let (engine, cell) = target?;
+        engine
+            .stop_execution(&cell, &token)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        Ok::<String, String>(String::new())
+    });
+    rv.set(promise_for(scope, async_id));
 }
