@@ -187,17 +187,19 @@ impl Daemon {
 }
 
 fn fixture(replies: Vec<Reply>) -> (ContainerEngine, Arc<CellContainer>, Daemon) {
-    // asyncrt retains one process-wide host handle. Keep that runtime alive
-    // across tests instead of capturing a per-test runtime that is dropped.
+    // asyncrt retains one process-wide host handle and, since 0.6, refuses a
+    // second installation. Keep that runtime alive across tests and install
+    // its handle exactly once, instead of a per-test runtime that is dropped.
     static HOST: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    let host = HOST.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
+    HOST.get_or_init(|| {
+        let host = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
-            .unwrap()
+            .unwrap();
+        asyncrt::set_host_handle(host.handle().clone());
+        host
     });
-    asyncrt::set_host_handle(host.handle().clone());
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("engine.sock");
     let listener = UnixListener::bind(&socket).unwrap();
